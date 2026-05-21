@@ -77,6 +77,21 @@ systemctl --user enable --now hyprstate.service
 systemctl --user enable hyprstate-restore.service
 ```
 
+### 5. Hyprland Integration (`hyprland.conf`)
+
+To ensure that systemd has access to the active Wayland session variables and that the compositor is fully initialized before restoration kicks in, integrate the following `exec-once` chain into your `hyprland.conf` (or your dedicated `execs.conf` startup file):
+
+```ini
+exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE && dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE && sleep 2 && systemctl --user start hyprstate-restore.service && systemctl --user start hyprstate.service
+```
+
+This sequence:
+1. Imports modern desktop session variables to the systemd user environment.
+2. Registers them with D-Bus.
+3. Pauses for **2 seconds** to allow Hyprland to fully settle and start its socket listeners.
+4. Triggers the restoration engine to perfectly route historical windows.
+5. Launches the lightweight event tracking daemon.
+
 *Note: The restore service runs once at graphical startup and terminates immediately after launching your applications.*
 
 ---

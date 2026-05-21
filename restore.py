@@ -155,6 +155,113 @@ def load_session_state(state_path: Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Window Mapping Event Listener
+# ---------------------------------------------------------------------------
+
+class WindowMapListener:
+    """
+    Listens to the Hyprland event socket (.socket2.sock) in the background
+    to detect when spawned windows map to the compositor.
+
+    This allows the restoration engine to wait exactly as long as needed
+    for each window to map (typically 50-200ms) before cleaning up its
+    temporary routing rules, eliminating timing races without long static sleeps.
+    """
+
+    def __init__(self, socket_path: str) -> None:
+        self.socket_path = socket_path
+        self.listeners: list[asyncio.Future[str]] = []
+        self._task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        """Start the background event reading task."""
+        self._task = asyncio.create_task(self._read_loop())
+
+    async def stop(self) -> None:
+        """Stop the background event reading task."""
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+
+    async def _read_loop(self) -> None:
+        while True:
+            try:
+                reader, writer = await asyncio.open_unix_connection(self.socket_path)
+                try:
+                    while True:
+                        line_bytes = await reader.readline()
+                        if not line_bytes:
+                            break
+                        line = line_bytes.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+
+                        if line.startswith("openwindow>>"):
+                            data = line[len("openwindow>>"):]
+                            parts = data.split(",", 3)
+                            if len(parts) >= 3:
+                                win_class = parts[2]
+                                # Wake up any matching pending futures
+                                for fut in list(self.listeners):
+                                    if not fut.done():
+                                        fut.set_result(win_class)
+                finally:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("Error in event listener loop: %s", exc)
+                await asyncio.sleep(0.5)
+
+    async def wait_for_map(self, target_class: str, timeout: float = 8.0) -> bool:
+        """
+        Wait for a window of the given class to map to the compositor.
+
+        Args:
+            target_class: Expected window class (e.g. 'foot', 'zen').
+            timeout: Maximum seconds to wait before falling back.
+
+        Returns:
+            True if the window was observed mapping, False otherwise.
+        """
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self.listeners.append(fut)
+
+        target_lower = target_class.lower()
+
+        try:
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                remaining = timeout - (time.time() - start_time)
+                if remaining <= 0:
+                    break
+                try:
+                    mapped_class = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
+                    if mapped_class.lower() == target_lower:
+                        return True
+                    else:
+                        # Not the window class we want; keep waiting with a fresh future
+                        if fut in self.listeners:
+                            self.listeners.remove(fut)
+                        fut = loop.create_future()
+                        self.listeners.append(fut)
+                except asyncio.TimeoutError:
+                    break
+            return False
+        finally:
+            if fut in self.listeners:
+                self.listeners.remove(fut)
+
+
+# ---------------------------------------------------------------------------
 # Window Rule Injection
 # ---------------------------------------------------------------------------
 
@@ -397,6 +504,7 @@ def _build_launch_command(
 async def launch_window(
     socket_path: str,
     window_entry: dict[str, Any],
+    map_listener: WindowMapListener | None = None,
     dry_run: bool = False,
 ) -> bool:
     """
@@ -475,10 +583,15 @@ async def launch_window(
         return False
 
     # Step 3: Wait for the window to map, then clean up the rule.
-    # We wait a reasonable amount of time for the Wayland surface to be
-    # created. The window rule handles the actual routing, so timing
-    # here is only relevant for cleanup — not correctness.
-    await asyncio.sleep(1.5)
+    # If a map listener is provided, we dynamically wait for the window to map.
+    # Otherwise, fall back to a static sleep.
+    if map_listener and window_class:
+        logger.debug("Waiting for window %s to map dynamically...", window_class)
+        success = await map_listener.wait_for_map(window_class, timeout=8.0)
+        if not success:
+            logger.warning("Timed out waiting for %s to map. Proceeding with cleanup.", window_class)
+    else:
+        await asyncio.sleep(1.5)
 
     # Step 4: Remove the temporary rule
     if rule_name:
@@ -572,26 +685,37 @@ async def restore_session(
     total_launched = 0
     total_failed = 0
 
-    # Launch workspace by workspace, windows sequentially within each
-    for ws_id in sorted(by_workspace.keys()):
-        ws_windows = by_workspace[ws_id]
-        logger.info(
-            "Restoring workspace %d (%d windows)", ws_id, len(ws_windows)
-        )
+    # Start the dynamic map listener if not a dry run
+    map_listener = None
+    if not dry_run:
+        socket2_path = str(socket_dir / ".socket2.sock")
+        map_listener = WindowMapListener(socket2_path)
+        await map_listener.start()
 
-        for window_entry in ws_windows:
-            success = await launch_window(
-                socket_path, window_entry, dry_run=dry_run
+    try:
+        # Launch workspace by workspace, windows sequentially within each
+        for ws_id in sorted(by_workspace.keys()):
+            ws_windows = by_workspace[ws_id]
+            logger.info(
+                "Restoring workspace %d (%d windows)", ws_id, len(ws_windows)
             )
-            if success:
-                total_launched += 1
-            else:
-                total_failed += 1
 
-            # Small delay between launches within the same workspace
-            # to let the layout engine process each window
-            if not dry_run:
-                await asyncio.sleep(0.5)
+            for window_entry in ws_windows:
+                success = await launch_window(
+                    socket_path, window_entry, map_listener=map_listener, dry_run=dry_run
+                )
+                if success:
+                    total_launched += 1
+                else:
+                    total_failed += 1
+
+                # Small delay between launches within the same workspace
+                # to let the layout engine process each window
+                if not dry_run:
+                    await asyncio.sleep(0.5)
+    finally:
+        if map_listener:
+            await map_listener.stop()
 
     logger.info(
         "Restoration complete: %d launched, %d failed, %d skipped",
