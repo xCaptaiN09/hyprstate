@@ -94,6 +94,31 @@ This sequence:
 
 *Note: The restore service runs once at graphical startup and terminates immediately after launching your applications.*
 
+### 6. Uninstallation
+
+To completely uninstall Hyprstate and restore your system configuration to default:
+
+1. **Stop and disable the services**:
+   ```bash
+   systemctl --user disable --now hyprstate.service
+   systemctl --user disable --now hyprstate-restore.service
+   ```
+
+2. **Remove the systemd unit files**:
+   ```bash
+   rm -f ~/.config/systemd/user/hyprstate.service
+   rm -f ~/.config/systemd/user/hyprstate-restore.service
+   systemctl --user daemon-reload
+   ```
+
+3. **Delete configuration and state directories**:
+   ```bash
+   rm -rf ~/.config/hyprstate/
+   ```
+
+4. **Clean up `hyprland.conf`**:
+   Remove the `systemctl --user start hyprstate-restore.service` and `systemctl --user start hyprstate.service` commands from your `exec-once` chain in your `hyprland.conf` (or dedicated `execs.conf` file).
+
 ---
 
 ## Manual Usage
