@@ -544,13 +544,19 @@ async def restore_session(
         logger.critical("Hyprland is not responding: %s", exc)
         return
 
-    # Filter to only launchable windows (have a known profile)
-    launchable = [w for w in windows if w.get("profile_key")]
-    skipped = len(windows) - len(launchable)
+    # Filter to only launchable windows (either have a known profile, or can be resolved via generic fallback)
+    launchable = []
+    skipped = 0
+    for w in windows:
+        cmd, _ = _build_launch_command(w)
+        if cmd:
+            launchable.append(w)
+        else:
+            skipped += 1
 
     if skipped > 0:
         logger.info(
-            "Skipping %d windows without known profiles", skipped
+            "Skipping %d windows without launchable profiles or fallbacks", skipped
         )
 
     if not launchable:

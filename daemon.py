@@ -50,6 +50,9 @@ from config import (
 
 logger = logging.getLogger("hyprstate")
 
+# Global flag to freeze state and bypass writes during compositor/system shutdown
+SHUTDOWN_INITIATED = False
+
 
 def _setup_logging() -> None:
     """Configure logging to both stderr and the log file."""
@@ -546,6 +549,11 @@ def write_state_atomic(snapshot: dict[str, Any]) -> None:
     Args:
         snapshot: The session state dictionary to persist.
     """
+    global SHUTDOWN_INITIATED
+    if SHUTDOWN_INITIATED:
+        logger.info("State write bypassed: shutdown initiated")
+        return
+
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     payload = json.dumps(snapshot, indent=2, ensure_ascii=False)
@@ -635,7 +643,9 @@ async def _listen_events(
                 line_bytes = await reader.readline()
                 if not line_bytes:
                     # EOF — Hyprland closed the connection (compositor exit)
-                    logger.warning("Event socket EOF — compositor exited?")
+                    logger.warning("Event socket EOF — compositor exited? Freezing state.")
+                    global SHUTDOWN_INITIATED
+                    SHUTDOWN_INITIATED = True
                     break
 
                 line = line_bytes.decode("utf-8", errors="replace").strip()
@@ -735,15 +745,7 @@ async def _snapshot_loop(
                 logger.debug("Snapshot has no windows — skipping write")
 
         except asyncio.CancelledError:
-            # Final snapshot before shutdown
-            logger.info("Snapshot loop cancelled — writing final state")
-            try:
-                final = await build_snapshot(ipc)
-                if final and final.get("windows"):
-                    write_state_atomic(final)
-                    logger.info("Final state written successfully")
-            except Exception as exc:
-                logger.error("Failed to write final state: %s", exc)
+            logger.info("Snapshot loop cancelled — shutdown active (skipping final write)")
             return
 
         except Exception as exc:
@@ -794,8 +796,10 @@ async def run_daemon() -> None:
     shutdown_event = asyncio.Event()
 
     def _signal_handler(signum: int) -> None:
+        global SHUTDOWN_INITIATED
+        SHUTDOWN_INITIATED = True
         sig_name = signal.Signals(signum).name
-        logger.info("Received %s — initiating graceful shutdown", sig_name)
+        logger.info("Received %s — initiating graceful shutdown (freezing state)", sig_name)
         shutdown_event.set()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
