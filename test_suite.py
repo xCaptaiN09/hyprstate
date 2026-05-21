@@ -666,17 +666,29 @@ def test_restore_commands():
     else:
         results.fail("Unknown profile", f"Should not return cmd: {cmd}")
 
-    # Test with no profile_key
+    # Test with no profile_key (generic fallback should resolve thunar)
     no_profile = {
         "class": "thunar",
         "profile_key": None,
         "workspace_id": 3,
     }
     cmd, env = _build_launch_command(no_profile)
-    if cmd == []:
-        results.ok("None profile_key returns empty command")
+    if cmd and cmd[0].endswith("thunar"):
+        results.ok(f"None profile_key correctly resolves thunar: {cmd}")
     else:
-        results.fail("None profile_key", f"Got: {cmd}")
+        results.fail("None profile_key", f"Expected thunar resolution, got: {cmd}")
+
+    # Test with completely non-existent class (should return empty command)
+    non_existent = {
+        "class": "this_app_does_not_exist_xyz_123",
+        "profile_key": None,
+        "workspace_id": 3,
+    }
+    cmd, env = _build_launch_command(non_existent)
+    if cmd == []:
+        results.ok("Non-existent generic class returns empty command (won't launch)")
+    else:
+        results.fail("Non-existent generic class", f"Should not return cmd: {cmd}")
 
 
 # ---------------------------------------------------------------------------

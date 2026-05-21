@@ -11,6 +11,7 @@ ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 %h/Antigravity/Hyprstate/restore.py
+KillMode=process
 
 # Give applications time to launch
 TimeoutStartSec=120

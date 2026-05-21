@@ -249,7 +249,82 @@ def _build_launch_command(
     """
     profile_key = window_entry.get("profile_key")
     if not profile_key:
-        return [], None
+        # Generic fallback logic for unprofiled applications (e.g. browsers, file managers)
+        window_class = window_entry.get("class", "")
+        if not window_class:
+            return [], None
+
+        class_lower = window_class.lower()
+
+        # Popular hardcoded fallbacks to handle class-to-binary mismatches
+        generic_candidates = {
+            # Web Browsers
+            "zen": ["zen-browser", "zen"],
+            "zen-alpha": ["zen-browser", "zen"],
+            "google-chrome": ["google-chrome-stable", "google-chrome"],
+            "google-chrome-unstable": ["google-chrome-unstable"],
+            "chrome": ["google-chrome-stable", "google-chrome"],
+            "firefox": ["firefox"],
+            "firefox-developer-edition": ["firefox-developer-edition", "firefox"],
+            "chromium": ["chromium"],
+            "opera": ["opera"],
+            "brave-browser": ["brave-browser", "brave"],
+            "microsoft-edge-stable": ["microsoft-edge-stable", "microsoft-edge"],
+            "microsoft-edge-dev": ["microsoft-edge-dev"],
+            "vivaldi-stable": ["vivaldi-stable", "vivaldi"],
+
+            # File Managers
+            "thunar": ["thunar"],
+            "org.gnome.nautilus": ["nautilus"],
+            "nautilus": ["nautilus"],
+            "pcmanfm": ["pcmanfm"],
+            "pcmanfm-qt": ["pcmanfm-qt"],
+            "dolphin": ["dolphin"],
+            "nemo": ["nemo"],
+            "doublecmd": ["doublecmd"],
+
+            # Common desktop apps
+            "code": ["code"],
+            "code-oss": ["code-oss", "code"],
+            "sublime_text": ["subl"],
+            "spotify": ["spotify"],
+            "discord": ["discord"],
+            "steam": ["steam"],
+            "mpv": ["mpv"],
+            "vlc": ["vlc"],
+            "gimp": ["gimp"],
+            "blender": ["blender"],
+            "obsidian": ["obsidian"],
+            "slack": ["slack"],
+            "telegram-desktop": ["telegram-desktop", "telegram"],
+            "thunderbird": ["thunderbird"],
+            "transmission-gtk": ["transmission-gtk"],
+            "transmission-qt": ["transmission-qt"],
+            "qbittorrent": ["qbittorrent"],
+        }
+
+        candidates = generic_candidates.get(class_lower, [class_lower, window_class])
+
+        binary_path = None
+        for candidate in candidates:
+            resolved = shutil.which(candidate)
+            if resolved:
+                binary_path = resolved
+                break
+
+        if not binary_path:
+            logger.debug(
+                "No candidate binary found in PATH for generic class: %s",
+                window_class,
+            )
+            return [], None
+
+        logger.info(
+            "Resolved generic application class %s to binary %s",
+            window_class,
+            binary_path,
+        )
+        return [binary_path], None
 
     profile = APP_PROFILES.get(profile_key)
     if not profile:
