@@ -504,6 +504,7 @@ def _build_launch_command(
 async def launch_window(
     socket_path: str,
     window_entry: dict[str, Any],
+    active_rules: set[str],
     map_listener: WindowMapListener | None = None,
     dry_run: bool = False,
 ) -> bool:
@@ -519,6 +520,7 @@ async def launch_window(
     Args:
         socket_path: Path to .socket.sock.
         window_entry: Window state dictionary.
+        active_rules: A set to track active rules for global cleanup.
         dry_run: If True, only log what would be done.
 
     Returns:
@@ -553,54 +555,52 @@ async def launch_window(
             rule_name = await inject_workspace_rule(
                 socket_path, window_class, workspace_id
             )
+            active_rules.add(rule_name)
         except ConnectionError as exc:
             logger.error("Failed to inject window rule: %s", exc)
             # Continue anyway — window will just open on current workspace
 
-    # Step 2: Launch the application
-    logger.info(
-        "Launching on workspace %d: %s", workspace_id, cmd_str
-    )
-
     try:
-        proc = subprocess.Popen(
-            cmd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,  # Detach from our process group
+        # Step 2: Launch the application
+        logger.info(
+            "Launching on workspace %d: %s", workspace_id, cmd_str
         )
-        logger.debug("Spawned PID %d for %s", proc.pid, window_class)
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.error("Failed to launch %s: %s", cmd_str, exc)
-        # Clean up the rule even on failure
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,  # Detach from our process group
+            )
+            logger.debug("Spawned PID %d for %s", proc.pid, window_class)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.error("Failed to launch %s: %s", cmd_str, exc)
+            return False
+
+        # Step 3: Wait for the window to map, then clean up the rule.
+        # If a map listener is provided, we dynamically wait for the window to map.
+        # Otherwise, fall back to a static sleep.
+        if map_listener and window_class:
+            logger.debug("Waiting for window %s to map dynamically...", window_class)
+            success = await map_listener.wait_for_map(window_class, timeout=8.0)
+            if not success:
+                logger.warning("Timed out waiting for %s to map. Proceeding with cleanup.", window_class)
+        else:
+            await asyncio.sleep(1.5)
+
+        return True
+    finally:
+        # Step 4: Remove the temporary rule
         if rule_name:
             try:
                 await remove_workspace_rule(socket_path, rule_name)
             except ConnectionError:
-                pass
-        return False
-
-    # Step 3: Wait for the window to map, then clean up the rule.
-    # If a map listener is provided, we dynamically wait for the window to map.
-    # Otherwise, fall back to a static sleep.
-    if map_listener and window_class:
-        logger.debug("Waiting for window %s to map dynamically...", window_class)
-        success = await map_listener.wait_for_map(window_class, timeout=8.0)
-        if not success:
-            logger.warning("Timed out waiting for %s to map. Proceeding with cleanup.", window_class)
-    else:
-        await asyncio.sleep(1.5)
-
-    # Step 4: Remove the temporary rule
-    if rule_name:
-        try:
-            await remove_workspace_rule(socket_path, rule_name)
-        except ConnectionError:
-            logger.warning("Could not remove window rule %s", rule_name)
-
-    return True
+                logger.warning("Could not remove window rule %s", rule_name)
+            finally:
+                active_rules.discard(rule_name)
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +684,7 @@ async def restore_session(
 
     total_launched = 0
     total_failed = 0
+    active_rules: set[str] = set()
 
     # Start the dynamic map listener if not a dry run
     map_listener = None
@@ -702,7 +703,7 @@ async def restore_session(
 
             for window_entry in ws_windows:
                 success = await launch_window(
-                    socket_path, window_entry, map_listener=map_listener, dry_run=dry_run
+                    socket_path, window_entry, active_rules, map_listener=map_listener, dry_run=dry_run
                 )
                 if success:
                     total_launched += 1
@@ -716,6 +717,15 @@ async def restore_session(
     finally:
         if map_listener:
             await map_listener.stop()
+        # Clean up any remaining window rules to prevent rule leakage
+        if active_rules:
+            logger.info("Cleaning up %d leaked window rules...", len(active_rules))
+            for rule_name in list(active_rules):
+                try:
+                    await remove_workspace_rule(socket_path, rule_name)
+                except Exception:
+                    pass
+            active_rules.clear()
 
     logger.info(
         "Restoration complete: %d launched, %d failed, %d skipped",
