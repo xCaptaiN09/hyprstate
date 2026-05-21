@@ -14,7 +14,7 @@ Unlike standard session managers that simply reopen application binaries, Hyprst
 
 - ⚡ **Zero-Overhead Event Loop**: Binds to Hyprland's IPC socket (`.socket2.sock`) to react instantaneously to window actions. Consumes **0% CPU** when idle.
 - 🐚 **Deep Shell Context Tracking**: Extracts active CWDs and environment states from terminal child shells by traversing `/proc` trees. Out-of-the-box support for **Foot**, **Ghostty**, **Kitty**, and **Alacritty**.
-- 🚦 **Race-Free Workspace Routing**: Routes restored applications using dynamic, named Lua-compatible window rules injected *before* process execution. Applications land on their correct workspaces silently without timing race conditions.
+- 🚦 **Race-Free Workspace Routing**: Routes restored applications using event-driven `movetoworkspacesilent` dispatch based on exact compositor window addresses immediately after mapping. Applications land on their correct workspaces silently without timing race conditions, class collisions, or rule leakage.
 - 💾 **Crash-Resilient Atomic Writes**: Persists session manifests atomically using a `.tmp -> fsync -> rename -> fsync` parent-directory flush sequence. Guaranteed to prevent partial state corruption even under power failure.
 - 🛡️ **Clean Environment Whitelisting**: Employs a strict **whitelist-only** environment block capture. Volatile and session-specific tokens (like `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, and `HYPRLAND_INSTANCE_SIGNATURE`) are excluded to avoid stale environment pollution across system boots.
 
@@ -35,9 +35,9 @@ Unlike standard session managers that simply reopen application binaries, Hyprst
                                             [ Atomic Writes ] ──► ~/.config/hyprstate/session.json
                                                                            │
                                                                            ▼ (system boot / login)
-                                                                  [ Hyprstate Restorer ]
-                                                                           │
-                                                                           ▼ (named Lua rules injected)
+                                                                   [ Hyprstate Restorer ]
+                                                                            │
+                                                                            ▼ (movetoworkspacesilent dispatch)
                                                                  [ Perfect State Restored! ]
 ```
 

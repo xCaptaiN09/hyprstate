@@ -50,8 +50,7 @@ from config import (
 
 logger = logging.getLogger("hyprstate")
 
-# Global flag to freeze state and bypass writes during compositor/system shutdown
-SHUTDOWN_INITIATED = False
+
 
 
 def _setup_logging() -> None:
@@ -549,10 +548,6 @@ def write_state_atomic(snapshot: dict[str, Any]) -> None:
     Args:
         snapshot: The session state dictionary to persist.
     """
-    global SHUTDOWN_INITIATED
-    if SHUTDOWN_INITIATED:
-        logger.info("State write bypassed: shutdown initiated")
-        return
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -643,9 +638,7 @@ async def _listen_events(
                 line_bytes = await reader.readline()
                 if not line_bytes:
                     # EOF — Hyprland closed the connection (compositor exit)
-                    logger.warning("Event socket EOF — compositor exited? Freezing state.")
-                    global SHUTDOWN_INITIATED
-                    SHUTDOWN_INITIATED = True
+                    logger.warning("Event socket EOF — compositor exited?")
                     break
 
                 line = line_bytes.decode("utf-8", errors="replace").strip()
@@ -739,13 +732,11 @@ async def _snapshot_loop(
 
             # Build and write the snapshot
             snapshot = await build_snapshot(ipc)
-            if snapshot and snapshot.get("windows"):
+            if snapshot:
                 write_state_atomic(snapshot)
-            elif snapshot:
-                logger.debug("Snapshot has no windows — skipping write")
 
         except asyncio.CancelledError:
-            logger.info("Snapshot loop cancelled — shutdown active (skipping final write)")
+            logger.info("Snapshot loop cancelled")
             return
 
         except Exception as exc:
@@ -795,12 +786,27 @@ async def run_daemon() -> None:
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
 
+    async def _shutdown_with_final_snapshot():
+        """Take a final live snapshot and exit."""
+        logger.info("Taking final live snapshot before shutdown...")
+        try:
+            snapshot = await build_snapshot(ipc)
+            if snapshot:
+                write_state_atomic(snapshot)
+                window_count = len(snapshot.get("windows", []))
+                logger.info("Final snapshot written: %d windows", window_count)
+            else:
+                logger.warning("Final snapshot failed — keeping existing state")
+        except Exception as exc:
+            logger.error("Error during final snapshot: %s", exc)
+        finally:
+            shutdown_event.set()
+
     def _signal_handler(signum: int) -> None:
-        global SHUTDOWN_INITIATED
-        SHUTDOWN_INITIATED = True
         sig_name = signal.Signals(signum).name
-        logger.info("Received %s — initiating graceful shutdown (freezing state)", sig_name)
-        shutdown_event.set()
+        logger.info("Received %s — initiating graceful shutdown", sig_name)
+        # Schedule the final snapshot coroutine on the event loop
+        asyncio.ensure_future(_shutdown_with_final_snapshot())
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _signal_handler, sig)

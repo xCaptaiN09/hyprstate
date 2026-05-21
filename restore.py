@@ -5,20 +5,18 @@ Reads the persisted session state from .session.json and reconstructs
 the desktop environment:
 
     1. Reads the session manifest (windows, workspaces, shell contexts)
-    2. For each window, injects a temporary Hyprland window rule that
-       forces the application to open on the correct workspace silently
-    3. Launches the application with CWD and environment restored
-    4. Cleans up temporary window rules after all windows are spawned
+    2. Launches each application with CWD and environment restored
+    3. Waits for the window to map via the compositor event socket
+    4. Moves the window to its target workspace via dispatch
 
-Critical Design Decision — No Sleep-Based Workspace Routing:
-    We do NOT use `hyprctl dispatch workspace X` + `asyncio.sleep` to
-    switch workspaces before launching apps. This creates race conditions
-    because GUI applications take variable time to create their Wayland
-    surfaces. Instead, we inject a one-shot windowrulev2 BEFORE launching
-    each app:
-        hyprctl keyword windowrule "workspace <ID> silent, class:^<CLASS>$"
-    This tells Hyprland's rule engine to route the window to the correct
-    workspace the instant it maps, regardless of timing.
+Workspace Routing Strategy:
+    We listen for `openwindow>>ADDRESS,WS,CLASS,TITLE` events on
+    Hyprland's .socket2.sock. When a restored window maps, we extract
+    its compositor address and dispatch:
+        hyprctl dispatch movetoworkspacesilent <ID>,address:<ADDR>
+    This is more reliable than window rules because it uses the exact
+    window handle — no regex matching, no rule leakage, no class
+    collisions when restoring multiple windows of the same class.
 
 Usage:
     python3 restore.py              # Restore from default state file
@@ -33,7 +31,7 @@ import asyncio
 import json
 import logging
 import os
-import re
+
 import shlex
 import shutil
 import subprocess
@@ -163,14 +161,14 @@ class WindowMapListener:
     Listens to the Hyprland event socket (.socket2.sock) in the background
     to detect when spawned windows map to the compositor.
 
-    This allows the restoration engine to wait exactly as long as needed
-    for each window to map (typically 50-200ms) before cleaning up its
-    temporary routing rules, eliminating timing races without long static sleeps.
+    Captures both the window address and class from openwindow events,
+    allowing the restoration engine to move windows to their target
+    workspaces using the exact compositor handle.
     """
 
     def __init__(self, socket_path: str) -> None:
         self.socket_path = socket_path
-        self.listeners: list[asyncio.Future[str]] = []
+        self.listeners: list[asyncio.Future[tuple[str, str]]] = []
         self._task: asyncio.Task | None = None
 
     async def start(self) -> None:
@@ -203,11 +201,12 @@ class WindowMapListener:
                             data = line[len("openwindow>>"):]
                             parts = data.split(",", 3)
                             if len(parts) >= 3:
+                                win_address = parts[0]
                                 win_class = parts[2]
-                                # Wake up any matching pending futures
+                                # Wake up any pending futures with (address, class)
                                 for fut in list(self.listeners):
                                     if not fut.done():
-                                        fut.set_result(win_class)
+                                        fut.set_result((win_address, win_class))
                 finally:
                     writer.close()
                     try:
@@ -220,7 +219,7 @@ class WindowMapListener:
                 logger.debug("Error in event listener loop: %s", exc)
                 await asyncio.sleep(0.5)
 
-    async def wait_for_map(self, target_class: str, timeout: float = 8.0) -> bool:
+    async def wait_for_window(self, target_class: str, timeout: float = 8.0) -> str | None:
         """
         Wait for a window of the given class to map to the compositor.
 
@@ -229,10 +228,10 @@ class WindowMapListener:
             timeout: Maximum seconds to wait before falling back.
 
         Returns:
-            True if the window was observed mapping, False otherwise.
+            The window address (e.g. '55a139a9dfd0') if found, None on timeout.
         """
         loop = asyncio.get_running_loop()
-        fut = loop.create_future()
+        fut: asyncio.Future[tuple[str, str]] = loop.create_future()
         self.listeners.append(fut)
 
         target_lower = target_class.lower()
@@ -244,9 +243,9 @@ class WindowMapListener:
                 if remaining <= 0:
                     break
                 try:
-                    mapped_class = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
+                    address, mapped_class = await asyncio.wait_for(asyncio.shield(fut), timeout=remaining)
                     if mapped_class.lower() == target_lower:
-                        return True
+                        return address
                     else:
                         # Not the window class we want; keep waiting with a fresh future
                         if fut in self.listeners:
@@ -255,81 +254,10 @@ class WindowMapListener:
                         self.listeners.append(fut)
                 except asyncio.TimeoutError:
                     break
-            return False
+            return None
         finally:
             if fut in self.listeners:
                 self.listeners.remove(fut)
-
-
-# ---------------------------------------------------------------------------
-# Window Rule Injection
-# ---------------------------------------------------------------------------
-
-async def inject_workspace_rule(
-    socket_path: str,
-    window_class: str,
-    workspace_id: int,
-) -> str:
-    """
-    Inject a temporary Hyprland window rule that routes the next window
-    of the given class to a specific workspace silently.
-
-    This is the correct approach for workspace routing — NOT sleep-based
-    dispatch. The rule fires the instant the window's Wayland surface
-    maps to the compositor, regardless of application startup time.
-
-    Args:
-        socket_path: Path to .socket.sock.
-        window_class: The Wayland app-id / window class to match.
-        workspace_id: Target workspace ID.
-
-    Returns:
-        The generated unique rule name for later cleanup.
-    """
-    # Create a unique, safe rule name (alphanumeric and underscores only)
-    sanitized_class = re.sub(r'[^a-zA-Z0-9]', '_', window_class)
-    timestamp_ms = int(time.time() * 1000)
-    rule_name = f"hyprstate_{sanitized_class}_{timestamp_ms}"
-
-    # Escape the class name for regex (escape dots, etc.)
-    escaped_class = window_class.replace(".", "\\\\.")
-
-    # consolidated v0.55+ dynamic property assignment syntax
-    cmd = f"/keyword windowrule[{rule_name}] = workspace {workspace_id} silent, match:class ^{escaped_class}$"
-
-    response = await _hyprctl_command(socket_path, cmd)
-
-    if "ok" in response.lower() or not response.strip():
-        logger.debug("Injected window rule %s for class %s on workspace %d", rule_name, window_class, workspace_id)
-    else:
-        logger.warning(
-            "Window rule injection may have failed for %s: %r",
-            rule_name, response
-        )
-
-    return rule_name
-
-
-
-async def remove_workspace_rule(
-    socket_path: str,
-    rule_name: str,
-) -> None:
-    """
-    Remove a previously injected temporary window rule by disabling it.
-
-    Since dynamic 'enable false' can be ignored for static effects on older
-    compositors, we redefine the rule to match an impossible class name,
-    which instantly and safely prevents any future window from matching it.
-
-    Args:
-        socket_path: Path to .socket.sock.
-        rule_name: The unique name of the rule to disable.
-    """
-    command = f"/keyword windowrule[{rule_name}] = workspace 1 silent, match:class disabled_by_hyprstate"
-
-    response = await _hyprctl_command(socket_path, command)
-    logger.debug("Removed window rule %s: %r", rule_name, response)
 
 
 # ---------------------------------------------------------------------------
@@ -504,23 +432,21 @@ def _build_launch_command(
 async def launch_window(
     socket_path: str,
     window_entry: dict[str, Any],
-    active_rules: set[str],
     map_listener: WindowMapListener | None = None,
     dry_run: bool = False,
 ) -> bool:
     """
-    Launch a single window with workspace routing via temporary rules.
+    Launch a single window and route it to the correct workspace.
 
     Protocol:
-        1. Inject a windowrule to route the class to the target workspace
-        2. Launch the application subprocess
-        3. Wait briefly for the window to map
-        4. Remove the temporary windowrule
+        1. Launch the application subprocess
+        2. Wait for the openwindow event to get the compositor address
+        3. Dispatch movetoworkspacesilent to move it to the target workspace
 
     Args:
         socket_path: Path to .socket.sock.
         window_entry: Window state dictionary.
-        active_rules: A set to track active rules for global cleanup.
+        map_listener: Optional listener for detecting window map events.
         dry_run: If True, only log what would be done.
 
     Returns:
@@ -548,59 +474,52 @@ async def launch_window(
         )
         return True
 
-    # Step 1: Inject temporary window rule BEFORE launching the app
-    rule_name = None
-    if window_class:
-        try:
-            rule_name = await inject_workspace_rule(
-                socket_path, window_class, workspace_id
-            )
-            active_rules.add(rule_name)
-        except ConnectionError as exc:
-            logger.error("Failed to inject window rule: %s", exc)
-            # Continue anyway — window will just open on current workspace
+    # Step 1: Launch the application
+    logger.info(
+        "Launching on workspace %d: %s", workspace_id, cmd_str
+    )
 
     try:
-        # Step 2: Launch the application
-        logger.info(
-            "Launching on workspace %d: %s", workspace_id, cmd_str
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # Detach from our process group
         )
+        logger.debug("Spawned PID %d for %s", proc.pid, window_class)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error("Failed to launch %s: %s", cmd_str, exc)
+        return False
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,  # Detach from our process group
-            )
-            logger.debug("Spawned PID %d for %s", proc.pid, window_class)
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.error("Failed to launch %s: %s", cmd_str, exc)
-            return False
-
-        # Step 3: Wait for the window to map, then clean up the rule.
-        # If a map listener is provided, we dynamically wait for the window to map.
-        # Otherwise, fall back to a static sleep.
-        if map_listener and window_class:
-            logger.debug("Waiting for window %s to map dynamically...", window_class)
-            success = await map_listener.wait_for_map(window_class, timeout=8.0)
-            if not success:
-                logger.warning("Timed out waiting for %s to map. Proceeding with cleanup.", window_class)
-        else:
-            await asyncio.sleep(1.5)
-
-        return True
-    finally:
-        # Step 4: Remove the temporary rule
-        if rule_name:
+    # Step 2: Wait for the window to map and get its compositor address
+    if map_listener and window_class:
+        logger.debug("Waiting for window %s to map...", window_class)
+        address = await map_listener.wait_for_window(window_class, timeout=8.0)
+        if address:
+            # Step 3: Move the window to its target workspace
+            move_cmd = f"/dispatch movetoworkspacesilent {workspace_id},address:0x{address}"
             try:
-                await remove_workspace_rule(socket_path, rule_name)
-            except ConnectionError:
-                logger.warning("Could not remove window rule %s", rule_name)
-            finally:
-                active_rules.discard(rule_name)
+                await _hyprctl_command(socket_path, move_cmd)
+                logger.info(
+                    "Moved window 0x%s (%s) to workspace %d",
+                    address, window_class, workspace_id,
+                )
+            except ConnectionError as exc:
+                logger.warning(
+                    "Failed to move %s to workspace %d: %s",
+                    window_class, workspace_id, exc,
+                )
+        else:
+            logger.warning(
+                "Timed out waiting for %s to map — window stays on active workspace",
+                window_class,
+            )
+    else:
+        await asyncio.sleep(1.5)
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +603,6 @@ async def restore_session(
 
     total_launched = 0
     total_failed = 0
-    active_rules: set[str] = set()
 
     # Start the dynamic map listener if not a dry run
     map_listener = None
@@ -703,7 +621,7 @@ async def restore_session(
 
             for window_entry in ws_windows:
                 success = await launch_window(
-                    socket_path, window_entry, active_rules, map_listener=map_listener, dry_run=dry_run
+                    socket_path, window_entry, map_listener=map_listener, dry_run=dry_run
                 )
                 if success:
                     total_launched += 1
@@ -717,15 +635,6 @@ async def restore_session(
     finally:
         if map_listener:
             await map_listener.stop()
-        # Clean up any remaining window rules to prevent rule leakage
-        if active_rules:
-            logger.info("Cleaning up %d leaked window rules...", len(active_rules))
-            for rule_name in list(active_rules):
-                try:
-                    await remove_workspace_rule(socket_path, rule_name)
-                except Exception:
-                    pass
-            active_rules.clear()
 
     logger.info(
         "Restoration complete: %d launched, %d failed, %d skipped",
