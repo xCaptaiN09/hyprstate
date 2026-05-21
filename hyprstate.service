@@ -1,0 +1,35 @@
+[Unit]
+Description=Hyprstate Session Serializer Daemon
+Documentation=https://github.com/xCaptaiN09/Hyprstate
+# Only start after Hyprland's graphical session is fully up
+After=graphical-session.target
+PartOf=graphical-session.target
+
+# Require Hyprland-specific environment variables to be set.
+# The daemon will fail gracefully if they're missing, but this
+# prevents systemd from even attempting to start it outside a
+# Hyprland session.
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/Antigravity/Hyprstate/daemon.py
+Restart=on-failure
+RestartSec=3
+
+# Graceful shutdown — daemon catches SIGTERM and writes final state
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+# Resource limits — the daemon should be lightweight
+MemoryMax=64M
+CPUQuota=5%
+
+# Security hardening
+NoNewPrivileges=true
+
+# Pass through the Hyprland session environment
+# (systemd --user inherits these from the compositor)
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Hyprstate Session Restore (one-shot)
+Documentation=https://github.com/xCaptaiN09/Hyprstate
+# Run after the compositor is ready and the daemon has started
+After=graphical-session.target hyprstate.service
+
+# Only run if a saved session exists
+ConditionPathExists=%h/.config/hyprstate/session.json
+ConditionEnvironment=HYPRLAND_INSTANCE_SIGNATURE
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/Antigravity/Hyprstate/restore.py
+
+# Give applications time to launch
+TimeoutStartSec=120
+
+# Needs write access to nothing — only reads state and launches apps
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local configurations and logs
+*.log
+*.tmp
+local_test/
+
+# State file backups if tested locally
+session.json
+session.json.tmp
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
